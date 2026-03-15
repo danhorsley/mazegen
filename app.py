@@ -48,6 +48,7 @@ tuning_keys = [
     'seep_base',
     'flow_with', 'flow_perp', 'flow_against',
     'regrow_time',
+    'regrow_chance',
 ]
 tuning = {
     'fire_spread':   {'val': 0.10, 'min': 0.0, 'max': 0.50, 'step': 0.01, 'fmt': '.2f', 'label': 'Spread Base'},
@@ -61,7 +62,8 @@ tuning = {
     'flow_with':     {'val': 0.12, 'min': 0.0, 'max': 0.30, 'step': 0.01, 'fmt': '.2f', 'label': 'Flow With'},
     'flow_perp':     {'val': 0.04, 'min': 0.0, 'max': 0.20, 'step': 0.01, 'fmt': '.2f', 'label': 'Flow Perp'},
     'flow_against':  {'val': 0.01, 'min': 0.0, 'max': 0.10, 'step': 0.005,'fmt': '.3f', 'label': 'Flow Against'},
-    'regrow_time':   {'val': 150,  'min': 30,  'max': 500,  'step': 10,   'fmt': '.0f', 'label': 'Regrow Time'},
+    'regrow_time':   {'val': 150,  'min': 30,  'max': 500,  'step': 10,   'fmt': '.0f', 'label': 'Regrow Cool'},
+    'regrow_chance': {'val': 0.08, 'min': 0.01,'max': 0.50, 'step': 0.01, 'fmt': '.2f', 'label': 'Regrow Spread'},
 }
 def tv(k): return tuning[k]['val']
 
@@ -100,7 +102,8 @@ pygame.init()
 MAZE_PX_W = MAZE_WIDTH * CELL_SIZE
 MAZE_PX_H = MAZE_HEIGHT * CELL_SIZE
 HUD_HEIGHT = 36
-screen = pygame.display.set_mode((MAZE_PX_W, MAZE_PX_H + HUD_HEIGHT))
+SIDEBAR_W = 220
+screen = pygame.display.set_mode((MAZE_PX_W + SIDEBAR_W, MAZE_PX_H + HUD_HEIGHT))
 pygame.display.set_caption("Living Maze — Navigate the Chaos")
 clock = pygame.time.Clock()
 pygame.key.set_repeat(150, 80)
@@ -147,8 +150,7 @@ unlock_timer = 0
 
 lightning_timer = 0
 
-# Editor
-editor_mode = False
+# Editor sidebar
 editor_sel = 0
 
 directions = [(0, 1), (0, -1), (1, 0), (-1, 0)]
@@ -433,6 +435,9 @@ def update_fire():
                 nx, ny = x + dx, y + dy
                 if 0 <= nx < MAZE_WIDTH and 0 <= ny < MAZE_HEIGHT:
                     if maze[ny][nx] in (0, 2):
+                        # Fire on open path (embers) can only ignite wood, not more open air
+                        if maze[y][x] == 0 and maze[ny][nx] == 0:
+                            continue
                         if water[ny][nx] >= 3:
                             continue
                         if water[ny][nx] >= 1 and random.random() > 0.12:
@@ -520,11 +525,32 @@ def update_regrowth():
     for y in range(MAZE_HEIGHT):
         for x in range(MAZE_WIDTH):
             if regrow[y][x] > 0:
+                # Cooldown phase — count down, then become fertile (-1)
                 regrow[y][x] -= 1
-                if regrow[y][x] <= 0:
-                    if maze[y][x] == 0 and fire[y][x] == 0:
-                        if (x, y) != (player_x, player_y) and pickups[y][x] is None:
-                            maze[y][x] = 2
+                if regrow[y][x] == 0:
+                    regrow[y][x] = -1  # now fertile
+            elif regrow[y][x] == -1:
+                # Fertile phase — can regrow if adjacent to existing wood
+                if maze[y][x] != 0 or fire[y][x] > 0:
+                    regrow[y][x] = 0  # no longer eligible
+                    continue
+                # Safety buffer: don't regrow on or adjacent to player
+                dx = abs(x - player_x)
+                dy = abs(y - player_y)
+                if dx <= 1 and dy <= 1:
+                    continue
+                # Check for adjacent wood to grow from
+                has_neighbor_wood = False
+                for ddx, ddy in directions:
+                    nx, ny = x + ddx, y + ddy
+                    if 0 <= nx < MAZE_WIDTH and 0 <= ny < MAZE_HEIGHT:
+                        if maze[ny][nx] == 2:
+                            has_neighbor_wood = True
+                            break
+                if has_neighbor_wood and random.random() < tv('regrow_chance'):
+                    if pickups[y][x] is None:
+                        maze[y][x] = 2
+                        regrow[y][x] = 0
 
 def reset_lightning_timer():
     global lightning_timer
@@ -700,7 +726,16 @@ def draw_maze():
             elif fire[y][x] > 0:
                 pygame.draw.rect(screen, FIRE_COLORS[min(fire[y][x]-1, 3)], rect)
             else:
-                col = WATER_COLORS[min(water[y][x]-1, 4)] if water[y][x] > 0 else PATH_COLOR
+                if water[y][x] > 0:
+                    col = WATER_COLORS[min(water[y][x]-1, 4)]
+                elif regrow[y][x] == -1:
+                    # Fertile ground — subtle green tint shows wood creeping in
+                    col = (35, 45, 30)
+                elif regrow[y][x] > 0:
+                    # Cooling down — subtle warm tint (recently burned)
+                    col = (40, 32, 28)
+                else:
+                    col = PATH_COLOR
                 pygame.draw.rect(screen, col, rect)
 
 def draw_grid():
@@ -844,36 +879,33 @@ def draw_hud():
     rx -= tab_hint.get_width() + 2
     screen.blit(tab_hint, (rx, hud_y + 13))
 
-def draw_editor():
-    if not editor_mode:
-        return
-    panel_w = 210
-    row_h = 16
-    panel_h = len(tuning_keys) * row_h + 24
-    panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
-    panel.fill((0, 0, 0, 200))
-    screen.blit(panel, (4, 4))
+def draw_sidebar():
+    sx = MAZE_PX_W  # sidebar left edge
+    # Background
+    pygame.draw.rect(screen, (20, 20, 28), (sx, 0, SIDEBAR_W, MAZE_PX_H + HUD_HEIGHT))
+    pygame.draw.line(screen, (60, 60, 80), (sx, 0), (sx, MAZE_PX_H + HUD_HEIGHT), 1)
 
     # Title
-    title = font_ed.render("TUNING [F1]  [/] -/=", True, (255, 200, 100))
-    screen.blit(title, (8, 6))
+    title = font_ed.render("TUNING  [/] -/=", True, (255, 200, 100))
+    screen.blit(title, (sx + 8, 8))
 
+    row_h = 18
     for i, key in enumerate(tuning_keys):
         t = tuning[key]
-        y = 22 + i * row_h
+        y = 30 + i * row_h
         selected = (i == editor_sel)
         col = (255, 255, 100) if selected else (180, 180, 200)
-        marker = ">" if selected else " "
+        marker = "\u25b6" if selected else " "
         fmt = t['fmt']
         val_str = f"{t['val']:{fmt}}"
+        text = font_ed.render(f"{marker}{t['label']:.<14s}{val_str}", True, col)
+        screen.blit(text, (sx + 8, y))
         # Bar showing position in range
         ratio = (t['val'] - t['min']) / max(0.001, t['max'] - t['min'])
-        bar_w = 40
-        text = font_ed.render(f"{marker}{t['label']:.<14s}{val_str}", True, col)
-        screen.blit(text, (8, y + 4))
-        bx = 8 + text.get_width() + 4
-        pygame.draw.rect(screen, (40, 40, 60), (bx, y + 6, bar_w, 6))
-        pygame.draw.rect(screen, col, (bx, y + 6, int(bar_w * ratio), 6))
+        bar_w = SIDEBAR_W - 24
+        bar_y = y + 14
+        pygame.draw.rect(screen, (40, 40, 60), (sx + 8, bar_y, bar_w, 3))
+        pygame.draw.rect(screen, col, (sx + 8, bar_y, int(bar_w * ratio), 3))
 
 def draw_messages():
     if not player_alive:
@@ -909,18 +941,16 @@ while running:
         if event.type == pygame.QUIT:
             running = False
         elif event.type == pygame.KEYDOWN:
-            # Editor controls (always available)
-            if event.key == pygame.K_F1:
-                editor_mode = not editor_mode
-            elif editor_mode and event.key == pygame.K_LEFTBRACKET:
+            # Sidebar tuning controls (always active)
+            if event.key == pygame.K_LEFTBRACKET:
                 editor_sel = (editor_sel - 1) % len(tuning_keys)
-            elif editor_mode and event.key == pygame.K_RIGHTBRACKET:
+            elif event.key == pygame.K_RIGHTBRACKET:
                 editor_sel = (editor_sel + 1) % len(tuning_keys)
-            elif editor_mode and event.key == pygame.K_MINUS:
+            elif event.key == pygame.K_MINUS:
                 k = tuning_keys[editor_sel]
                 t = tuning[k]
                 t['val'] = max(t['min'], round(t['val'] - t['step'], 4))
-            elif editor_mode and event.key == pygame.K_EQUALS:
+            elif event.key == pygame.K_EQUALS:
                 k = tuning_keys[editor_sel]
                 t = tuning[k]
                 t['val'] = min(t['max'], round(t['val'] + t['step'], 4))
@@ -990,7 +1020,7 @@ while running:
     draw_breath_bar()
     draw_hud()
     draw_messages()
-    draw_editor()
+    draw_sidebar()
 
     pygame.display.flip()
     clock.tick(15)
